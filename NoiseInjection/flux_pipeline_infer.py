@@ -1136,7 +1136,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
     
             # Inject noise after lower sigmas
             injected_noise = torch.randn_like(latents) * higher_sigmas[0]
-            latents = latents + injected_noise
+            latents = latents + injected_noise*.85
     
             # Process remaining timesteps
             for i, t in enumerate(higher_timesteps, start=len(lower_timesteps)):
