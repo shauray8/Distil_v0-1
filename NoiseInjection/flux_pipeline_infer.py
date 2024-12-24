@@ -640,6 +640,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        sigma_threshold: float = .45,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -840,9 +841,18 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         )
 
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-        # 6. Denoising loop
+
+        split_threshold = sigma_threshold
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        split_index = np.argmax(sigmas < split_threshold)  # Find split point
+        lower_sigmas = sigmas[:split_index]
+        higher_sigmas = sigmas[split_index:]
+
+        lower_timesteps = timesteps[:split_index]
+        higher_timesteps = timesteps[split_index:]
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
+            for i, t in enumerate(lower_timesteps):
                 if self.interrupt:
                     continue
 
@@ -894,6 +904,58 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+            injected_noise = torch.randn_like(latents) * higher_sigmas[0]
+            latents = latents + injected_noise*.95
+    
+            for i, t in enumerate(higher_timesteps, start=len(lower_timesteps)):
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+                # handle guidance
+                if self.transformer.config.guidance_embeds:
+                    guidance = torch.tensor([guidance_scale], device=device)
+                    guidance = guidance.expand(latents.shape[0])
+                else:
+                    guidance = None
+
+                noise_pred = self.transformer(
+                    hidden_states=latents,
+                    # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transformer model (we should not keep it but I want to keep the inputs same for the model for testing)
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids[0],
+                    img_ids=latent_image_ids[0],
+                    joint_attention_kwargs=self.joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
+
+                # compute the previous noisy sample x_t -> x_t-1
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                        latents = latents.to(latents_dtype)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                # call the callback, if provided
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+                if XLA_AVAILABLE:
+                    xm.mark_step()
+                
+
         if output_type == "latent":
             image = latents
 
@@ -933,7 +995,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
-        sigma_threshold: int = .25,
+        sigma_threshold: float = .45,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -1102,8 +1164,6 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
         lower_timesteps = timesteps[:split_index]
         higher_timesteps = timesteps[split_index:]
-
-        print(lower_timesteps, higher_timesteps)
     
         # Denoising loop with split sigmas
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1117,8 +1177,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
+                    txt_ids=text_ids[0],
+                    img_ids=latent_image_ids[0],
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
@@ -1136,7 +1196,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
     
             # Inject noise after lower sigmas
             injected_noise = torch.randn_like(latents) * higher_sigmas[0]
-            latents = latents + injected_noise*.85
+            latents = latents + injected_noise*.95
     
             # Process remaining timesteps
             for i, t in enumerate(higher_timesteps, start=len(lower_timesteps)):
@@ -1148,8 +1208,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
+                    txt_ids=text_ids[0],
+                    img_ids=latent_image_ids[0],
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
@@ -1180,4 +1240,3 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             return (image,)
     
         return FluxPipelineOutput(images=image)
-
