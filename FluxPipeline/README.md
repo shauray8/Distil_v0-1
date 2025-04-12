@@ -1,0 +1,1 @@
+Approx VAE for fast decoding of in-between latents for FLUX, trained on `Rapidata/Reve-AI-Halfmoon_t2i_human_preference` I could have gotten away with training it on random tensors but I was worried about the distribution so here it is !
